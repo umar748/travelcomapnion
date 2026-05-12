@@ -3,8 +3,17 @@ import { useNavigate } from 'react-router-dom';
 import { Map, Plus, Search, Heart, User, Calendar } from 'lucide-react';
 import { getToken, getUser } from '../services/auth';
 import 'leaflet/dist/leaflet.css';
-import { MapContainer, TileLayer, Marker, Popup, useMapEvents } from 'react-leaflet';
+import { MapContainer, TileLayer, Marker, Popup, useMapEvents, Polyline } from 'react-leaflet';
 import L from 'leaflet';
+
+const MAX_BUDGET = 50000;
+
+const normalizeToStartOfDay = (value) => {
+  const date = new Date(value);
+  if (Number.isNaN(date.getTime())) return null;
+  date.setHours(0, 0, 0, 0);
+  return date;
+};
 
 const ExploreDestinations = () => {
   const navigate = useNavigate();
@@ -16,7 +25,7 @@ const ExploreDestinations = () => {
   const [coTravel, setCoTravel] = useState(true);
   const [departureMonth, setDepartureMonth] = useState('All months');
   const [duration, setDuration] = useState(15);
-  const [budget, setBudget] = useState(1500);
+  const [budget, setBudget] = useState(MAX_BUDGET);
   const [continent, setContinent] = useState('All');
   const [sortBy, setSortBy] = useState('Recommended');
   const [bookmarked, setBookmarked] = useState({});
@@ -24,6 +33,8 @@ const ExploreDestinations = () => {
   const [loading, setLoading] = useState(true);
   const [feedback, setFeedback] = useState('');
   const [requestingId, setRequestingId] = useState('');
+  const [requestStatus, setRequestStatus] = useState({});
+  const [outgoingRequests, setOutgoingRequests] = useState({});
   const [showMap, setShowMap] = useState(false);
   const [mapCenter, setMapCenter] = useState([33.6844, 73.0479]);
   const [mapZoom, setMapZoom] = useState(13);
@@ -59,11 +70,6 @@ const ExploreDestinations = () => {
     return null;
   };
 
-  const combinedMarkers = [
-    ...(userMarker ? [userMarker] : []),
-    ...tripMarkers
-  ];
-
   const formatDateRange = (startDate, endDate) => {
     const start = new Date(startDate);
     const end = new Date(endDate);
@@ -71,6 +77,13 @@ const ExploreDestinations = () => {
     const startText = start.toLocaleDateString('en-US', { month: 'short', day: 'numeric' });
     const endText = end.toLocaleDateString('en-US', { month: 'short', day: 'numeric' });
     return `${startText} - ${endText}`;
+  };
+
+  const getDaysRemaining = (endDate) => {
+    const today = normalizeToStartOfDay(new Date());
+    const tripEnd = normalizeToStartOfDay(endDate);
+    if (!today || !tripEnd) return null;
+    return Math.ceil((tripEnd.getTime() - today.getTime()) / 86400000);
   };
 
   const inferTripImage = (destination = '') => {
@@ -83,6 +96,36 @@ const ExploreDestinations = () => {
     return 'https://images.unsplash.com/photo-1500530855697-b586d89ba3ee?w=800&q=80';
   };
 
+  const computeDistanceKm = (lat1, lon1, lat2, lon2) => {
+    const toRad = (value) => (value * Math.PI) / 180;
+    const R = 6371; // Earth radius in km
+    const dLat = toRad(lat2 - lat1);
+    const dLon = toRad(lon2 - lon1);
+    const a =
+      Math.sin(dLat / 2) * Math.sin(dLat / 2) +
+      Math.cos(toRad(lat1)) * Math.cos(toRad(lat2)) *
+      Math.sin(dLon / 2) * Math.sin(dLon / 2);
+    const c = 2 * Math.atan2(Math.sqrt(a), Math.sqrt(1 - a));
+    return Number((R * c).toFixed(1));
+  };
+
+  const tripMarkersWithDistance = useMemo(() => {
+    if (!userMarker) return tripMarkers;
+    return [...tripMarkers]
+      .map((marker) => ({
+        ...marker,
+        distanceKm: computeDistanceKm(userMarker.lat, userMarker.lon, marker.lat, marker.lon)
+      }))
+      .sort((a, b) => (a.distanceKm || 0) - (b.distanceKm || 0));
+  }, [tripMarkers, userMarker]);
+
+  const nearestTrip = tripMarkersWithDistance.length > 0 ? tripMarkersWithDistance[0] : null;
+
+  const combinedMarkers = useMemo(() => [
+    ...(userMarker ? [userMarker] : []),
+    ...tripMarkersWithDistance
+  ], [userMarker, tripMarkersWithDistance]);
+
   useEffect(() => {
     let cancelled = false;
 
@@ -91,10 +134,20 @@ const ExploreDestinations = () => {
         setLoading(true);
         setFeedback('');
         const token = getToken();
-        const response = await fetch('/api/trips/discover', {
-          headers: { Authorization: `Bearer ${token || ''}` }
-        });
+        const [response, outgoingResponse] = await Promise.all([
+          fetch('/api/trips/discover', {
+            headers: {}
+          }),
+          token
+            ? fetch('/api/requests/outgoing', {
+                headers: { Authorization: `Bearer ${token}` }
+              })
+            : Promise.resolve(null)
+        ]);
         const data = await response.json().catch(() => ({}));
+        const outgoingData = outgoingResponse
+          ? await outgoingResponse.json().catch(() => ({}))
+          : { success: true, requests: [] };
         if (!response.ok || !data?.success) {
           throw new Error(data?.message || 'Failed to load trips');
         }
@@ -122,6 +175,9 @@ const ExploreDestinations = () => {
             title: trip.title || `${trip.destination} Trip`,
             duration: durationDays,
             dates: formatDateRange(trip.start_date, trip.end_date),
+            startDate: trip.start_date,
+            endDate: trip.end_date,
+            daysRemaining: getDaysRemaining(trip.end_date),
             organizer: {
               name: creatorName,
               role: 'Trip Organizer',
@@ -142,6 +198,11 @@ const ExploreDestinations = () => {
 
         if (!cancelled) {
           setTrips(mappedTrips);
+          const outgoingMap = {};
+          (outgoingData.requests || []).forEach((request) => {
+            outgoingMap[String(request.trip_id)] = request.status;
+          });
+          setOutgoingRequests(outgoingMap);
         }
       } catch (error) {
         if (!cancelled) {
@@ -186,14 +247,15 @@ const ExploreDestinations = () => {
 
     const startMonthToken = monthMap[departureMonth] || 'All months';
     let list = trips.filter((trip) => {
+      const isExpired = trip.daysRemaining != null && trip.daysRemaining < 0;
       const matchDest = !destinationSearch.trim()
         || trip.destination.toLowerCase().includes(destinationSearch.toLowerCase());
       const matchDuration = duration === 15 || trip.duration <= duration;
-      const matchBudget = trip.price <= budget;
+      const matchBudget = budget >= MAX_BUDGET || trip.price <= budget;
       const monthToken = trip.dates.split(' ')[0];
       const matchMonth = startMonthToken === 'All months' || monthToken === startMonthToken;
       const matchContinent = continent === 'All' || trip.continent === continent;
-      return matchDest && matchDuration && matchBudget && matchMonth && matchContinent;
+      return !isExpired && matchDest && matchDuration && matchBudget && matchMonth && matchContinent;
     });
 
     switch (sortBy) {
@@ -278,6 +340,10 @@ const ExploreDestinations = () => {
 
     setRequestingId(String(trip.id));
     setFeedback('');
+    setRequestStatus((prev) => ({
+      ...prev,
+      [trip.id]: { type: 'pending', message: 'Sending request...' }
+    }));
     try {
       const response = await fetch('/api/requests/send', {
         method: 'POST',
@@ -294,9 +360,19 @@ const ExploreDestinations = () => {
       if (!response.ok || !data?.success) {
         throw new Error(data?.message || 'Failed to send request');
       }
-      setFeedback(`Request sent to ${trip.organizer.name} for ${trip.destination}.`);
+      const successMessage = `Request sent to ${trip.organizer.name} for ${trip.destination}.`;
+      setFeedback(successMessage);
+      setRequestStatus((prev) => ({
+        ...prev,
+        [trip.id]: { type: 'success', message: successMessage }
+      }));
     } catch (error) {
-      setFeedback(error.message || 'Failed to send request');
+      const errorMessage = error.message || 'Failed to send request';
+      setFeedback(errorMessage);
+      setRequestStatus((prev) => ({
+        ...prev,
+        [trip.id]: { type: 'error', message: errorMessage }
+      }));
     } finally {
       setRequestingId('');
     }
@@ -479,15 +555,17 @@ const ExploreDestinations = () => {
               </div>
 
               <div>
-                <label className="block text-slate-300 font-semibold text-sm mb-3">Budget: ${budget}</label>
+                <label className="block text-slate-300 font-semibold text-sm mb-3">
+                  Budget: {budget >= MAX_BUDGET ? 'Any' : `$${budget}`}
+                </label>
                 <input
                   type="range"
                   min="0"
-                  max="5000"
-                  step="50"
+                  max={MAX_BUDGET}
+                  step="100"
                   value={budget}
                   onChange={(e) => setBudget(parseInt(e.target.value, 10))}
-                  style={getRangeBackground(budget, 5000)}
+                  style={getRangeBackground(budget, MAX_BUDGET)}
                   className="w-full h-2 rounded-lg appearance-none cursor-pointer slider"
                 />
               </div>
@@ -551,6 +629,14 @@ const ExploreDestinations = () => {
               <div className="grid grid-cols-1 md:grid-cols-2 xl:grid-cols-3 gap-6">
                 {filteredTrips.map((trip) => {
                   const isOwnTrip = String(trip.creatorId) === String(currentUser?.id || currentUser?.userId || currentUser?._id);
+                  const tripStatus = requestStatus[trip.id];
+                  const outgoingStatus = outgoingRequests[String(trip.id)];
+                  const isRequestLocked = outgoingStatus === 'pending' || outgoingStatus === 'accepted';
+                  const daysRemainingLabel = trip.daysRemaining === 0
+                    ? 'Ends today'
+                    : trip.daysRemaining === 1
+                      ? '1 day remaining'
+                      : `${trip.daysRemaining} days remaining`;
                   return (
                     <div
                       key={trip.id}
@@ -581,6 +667,12 @@ const ExploreDestinations = () => {
                             <span>{trip.dates}</span>
                           </div>
                         </div>
+
+                        {trip.daysRemaining != null && (
+                          <div className="mb-4 inline-flex rounded-full border border-amber-500/30 bg-amber-500/10 px-3 py-1 text-xs font-semibold text-amber-200">
+                            {daysRemainingLabel}
+                          </div>
+                        )}
 
                         <div className="flex items-center gap-3 mb-4 pb-4 border-b border-slate-700">
                           <div className="w-10 h-10 rounded-full bg-gradient-to-br from-blue-500 to-green-500 flex items-center justify-center text-white font-bold text-sm">
@@ -643,13 +735,43 @@ const ExploreDestinations = () => {
                                 e.stopPropagation();
                                 handleJoinRequest(trip);
                               }}
-                              disabled={isOwnTrip || requestingId === String(trip.id)}
+                              disabled={isOwnTrip || isRequestLocked || requestingId === String(trip.id)}
                               className="flex-1 bg-[#2563eb] hover:bg-[#1d4ed8] disabled:bg-slate-700 disabled:text-slate-400 text-white font-semibold py-3 px-5 rounded-xl transition-all duration-300 hover:transform hover:-translate-y-1 hover:shadow-lg hover:shadow-[#2563eb]/30"
                             >
-                              {isOwnTrip ? 'Your Trip' : requestingId === String(trip.id) ? 'Sending...' : 'Request to Join'}
+                              {isOwnTrip
+                                ? 'Your Trip'
+                                : outgoingStatus === 'accepted'
+                                  ? 'Accepted'
+                                  : outgoingStatus === 'pending'
+                                    ? 'Request Sent'
+                                    : requestingId === String(trip.id)
+                                      ? 'Sending...'
+                                      : 'Request to Join'}
                             </button>
                           </div>
                         </div>
+
+                        {tripStatus ? (
+                          <div
+                            className={`mt-4 rounded-xl border px-3 py-2 text-xs ${
+                              tripStatus.type === 'success'
+                                ? 'border-emerald-500/30 bg-emerald-500/10 text-emerald-200'
+                                : tripStatus.type === 'error'
+                                  ? 'border-red-500/30 bg-red-500/10 text-red-200'
+                                  : 'border-[#334155] bg-[#0f172a] text-slate-300'
+                            }`}
+                          >
+                            {tripStatus.message}
+                          </div>
+                        ) : outgoingStatus === 'pending' ? (
+                          <div className="mt-4 rounded-xl border border-amber-500/30 bg-amber-500/10 px-3 py-2 text-xs text-amber-200">
+                            You already sent a join request for this trip.
+                          </div>
+                        ) : outgoingStatus === 'accepted' ? (
+                          <div className="mt-4 rounded-xl border border-emerald-500/30 bg-emerald-500/10 px-3 py-2 text-xs text-emerald-200">
+                            Your request for this trip has already been accepted.
+                          </div>
+                        ) : null}
                       </div>
                     </div>
                   );
@@ -660,7 +782,7 @@ const ExploreDestinations = () => {
         </div>
       </div>
 
-      {showMap ? (
+      {/* {showMap ? (
         <div className="fixed inset-0 z-50 flex items-center justify-center bg-black/70 px-4 py-6">
           <div className="w-full max-w-6xl overflow-hidden rounded-3xl border border-[#334155] bg-[#1e293b] shadow-2xl">
             <div className="flex items-center justify-between border-b border-[#334155] px-6 py-4">
@@ -702,6 +824,29 @@ const ExploreDestinations = () => {
               </div>
             ) : null}
 
+            <div className="border-b border-[#334155] px-6 py-4 text-sm text-slate-300 bg-[#111827]/80">
+              <div className="grid grid-cols-1 md:grid-cols-3 gap-4">
+                <div>
+                  <p className="text-xs uppercase tracking-[0.2em] text-slate-500">Your Coordinates</p>
+                  <p className="mt-2 text-sm text-white">
+                    {userMarker ? `${userMarker.lat.toFixed(5)}, ${userMarker.lon.toFixed(5)}` : 'Waiting for location...'}
+                  </p>
+                </div>
+                <div>
+                  <p className="text-xs uppercase tracking-[0.2em] text-slate-500">Nearest Trip</p>
+                  <p className="mt-2 text-sm text-white">
+                    {nearestTrip ? `${nearestTrip.label} (${nearestTrip.distanceKm} km)` : 'No trips available'}
+                  </p>
+                </div>
+                <div>
+                  <p className="text-xs uppercase tracking-[0.2em] text-slate-500">Destination coordinates</p>
+                  <p className="mt-2 text-sm text-white">
+                    {nearestTrip ? `${nearestTrip.lat.toFixed(5)}, ${nearestTrip.lon.toFixed(5)}` : 'Select a trip marker'}
+                  </p>
+                </div>
+              </div>
+            </div>
+
             <div className="h-[70vh] w-full">
                 <MapContainer
                   center={mapCenter}
@@ -714,6 +859,12 @@ const ExploreDestinations = () => {
                   attribution="&copy; OpenStreetMap contributors"
                 />
                 <MapRecenter center={mapCenter} zoom={mapZoom} />
+                {userMarker && nearestTrip ? (
+                  <Polyline
+                    pathOptions={{ color: '#60a5fa', weight: 3, opacity: 0.75 }}
+                    positions={[[userMarker.lat, userMarker.lon], [nearestTrip.lat, nearestTrip.lon]]}
+                  />
+                ) : null}
                 {combinedMarkers.map((marker, index) => (
                   <Marker
                     key={`${marker.lat}-${marker.lon}-${index}`}
@@ -727,9 +878,18 @@ const ExploreDestinations = () => {
                           <div className="mt-1 text-sm">{marker.trip.title}</div>
                           <div className="mt-1 text-sm">By {marker.trip.organizer.name}</div>
                           <div className="mt-1 text-sm">${marker.trip.price}</div>
+                          <div className="mt-2 text-xs uppercase tracking-[0.15em] text-slate-500">Coordinates</div>
+                          <div className="text-sm">{marker.lat.toFixed(5)}, {marker.lon.toFixed(5)}</div>
+                          {marker.distanceKm != null ? (
+                            <div className="mt-2 text-sm font-semibold text-slate-700">{marker.distanceKm} km away</div>
+                          ) : null}
                         </div>
                       ) : (
-                        marker.label
+                        <div className="min-w-[160px] text-slate-900">
+                          <div className="font-bold">{marker.label}</div>
+                          <div className="mt-2 text-xs uppercase tracking-[0.15em] text-slate-500">Your location</div>
+                          <div className="text-sm">{marker.lat.toFixed(5)}, {marker.lon.toFixed(5)}</div>
+                        </div>
                       )}
                     </Popup>
                   </Marker>
@@ -738,7 +898,7 @@ const ExploreDestinations = () => {
             </div>
           </div>
         </div>
-      ) : null}
+      ) : null} */}
     </div>
   );
 };
